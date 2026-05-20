@@ -48,4 +48,4 @@ LAMMPS 22 Jul 2025 (64-bit, OpenMP) required for simulations.
 ## Citation
 
 H. V. Patel, DEM-BPM Simulation of LiFePO4 Battery Electrode Calendering,
-B.Tech Thesis, PDEU, Gandhinagar, 2025.
+B.Tech Thesis, PDEU, Gandhinagar, 2026.
