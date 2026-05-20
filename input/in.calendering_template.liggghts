@@ -1,0 +1,152 @@
+units           micro
+dimension       3
+boundary        __BOUNDARY__
+
+atom_style      bpm/sphere
+special_bonds   lj 0.0 1.0 1.0 coul 0.0 1.0 1.0
+newton          on off
+
+read_data       data.electrode __READ_DATA_ARGS__
+
+reset_timestep  0
+timestep        __TIMESTEP_US__
+
+group           AM   type 1
+group           CB   type 2
+group           PTFE type 3
+
+# Contact model: gran/hertz/history applies to all 3 particle types (AM, CB, PTFE)
+# pair_coeff * * uses geometric mixing for cross-type contacts
+pair_style      gran/hertz/history __HERTZ_KN__ NULL __HERTZ_GAMMA_N__ NULL __HERTZ_FRICTION__ 1
+pair_coeff      * *
+
+neighbor        0.001 bin
+neigh_modify    delay 0
+comm_modify     cutoff 7.0 vel yes
+
+# -----------------------------
+# BOND FRACTURE MODEL (3-phase PTFE dry electrode)
+# Bond 1: AM-CB   | Bond 2: AM-PTFE | Bond 3: CB-PTFE | Bond 4: CB-CB
+# PTFE bonds (2,3) have high eps_c (0.60-0.75) to model fibril ductility
+# -----------------------------
+__BOND_SETUP_BLOCK__
+
+# -----------------------------
+# PHYSICS
+# -----------------------------
+fix             integrator all nve/bpm/sphere
+fix             damp all viscous __SETTLING_DAMP__
+fix             grav all gravity __GRAVITY__ vector 0.0 0.0 -1.0
+
+# -----------------------------
+# WALLS
+# -----------------------------
+variable ztop0 equal __TOP_START__
+variable lx equal __LX__
+variable ly equal __LY__
+variable disp_top equal 0.0
+
+region bottom_wall plane 0 0 0 0 0 1 side in units box
+region top_wall plane 0 0 ${ztop0} 0 0 -1 side in move NULL NULL v_disp_top units box
+region left_wall plane 0 0 0 1 0 0 side in units box
+region right_wall plane __LX__ 0 0 -1 0 0 side in units box
+region front_wall plane 0 0 0 0 1 0 side in units box
+region back_wall plane 0 __LY__ 0 0 -1 0 side in units box
+
+
+fix bottom all wall/gran/region hertz/history __HERTZ_KN__ NULL __HERTZ_GAMMA_N__ NULL __HERTZ_FRICTION__ 1 region bottom_wall contacts
+fix top all wall/gran/region hertz/history __HERTZ_KN__ NULL __HERTZ_GAMMA_N__ NULL __HERTZ_FRICTION__ 1 region top_wall contacts
+fix left all wall/gran/region hertz/history __HERTZ_KN__ NULL __HERTZ_GAMMA_N__ NULL __HERTZ_FRICTION__ 1 region left_wall contacts
+fix right all wall/gran/region hertz/history __HERTZ_KN__ NULL __HERTZ_GAMMA_N__ NULL __HERTZ_FRICTION__ 1 region right_wall contacts
+fix front all wall/gran/region hertz/history __HERTZ_KN__ NULL __HERTZ_GAMMA_N__ NULL __HERTZ_FRICTION__ 1 region front_wall contacts
+fix back all wall/gran/region hertz/history __HERTZ_KN__ NULL __HERTZ_GAMMA_N__ NULL __HERTZ_FRICTION__ 1 region back_wall contacts
+
+# -----------------------------
+# OUTPUT
+# -----------------------------
+compute top_force_sum all reduce sum f_top[4]
+variable top_force equal abs(c_top_force_sum)
+variable pressure equal v_top_force/(lx*ly)
+variable simstep equal step
+variable pressure_abort equal 20000.0
+
+thermo __THERMO_EVERY__
+thermo_style custom step atoms v_disp_top v_top_force v_pressure__THERMO_EXTRA__
+thermo_modify    lost error lost/bond warn
+fix pressure_guard all halt __THERMO_EVERY__ v_pressure > ${pressure_abort} error hard
+fix pressurelog all print __THERMO_EVERY__ "${simstep} ${disp_top} ${top_force} ${pressure}__PRESSURELOG_EXTRA__" file pressure_log.txt screen no title "step disp_top top_force pressure active_bonds"
+
+dump traj all custom __DUMP_EVERY__ dump.calendering.lammpstrj __DUMP_COLUMNS__
+dump_modify traj sort id
+
+# -----------------------------
+# STAGE 1: SETTLING
+# -----------------------------
+run __SETTLING_STEPS__
+
+# Create the bonded network after the particles have relaxed, then snapshot
+# this settled/bonded state as the non-calendered reference.
+__BOND_CREATE_BLOCK__
+run __BOND_RELAX_STEPS__
+run 0
+write_dump all custom snapshot.bonded_initial.lammpstrj __DUMP_COLUMNS__
+
+unfix damp
+fix damp all viscous __PROCESS_DAMP__
+
+# -----------------------------
+# STAGE 2: COMPRESSION
+# -----------------------------
+variable v equal __COMPRESSION_VELOCITY__
+variable disp_top equal v_v*elapsed*dt
+run __COMPRESSION_STEPS__
+
+write_dump all custom snapshot.compressed.lammpstrj __DUMP_COLUMNS__
+
+# -----------------------------
+# STAGE 3: HOLD
+# -----------------------------
+variable disp_top equal ${v}*__COMPRESSION_STEPS__*dt
+run __HOLD_STEPS__
+
+# Snapshot at max compression (reference — full calendering load)
+write_dump all custom snapshot.at_max_compression.lammpstrj __DUMP_COLUMNS__
+
+# -----------------------------
+# STAGE 4: PARTIAL DECOMPRESSION
+# Wall lifts by __SPRINGBACK_FRACTION__ of compression distance.
+# This models the calender roll gap set at target calendered thickness.
+# Literature LFP cold-rolled springback: 10-20% (Schreiner 2020, Ngandjong 2021)
+# -----------------------------
+unfix damp
+fix damp all viscous __DECOMP_DAMP__
+
+variable v2 equal __DECOMPRESSION_VELOCITY__
+variable disp_top equal ${v}*__COMPRESSION_STEPS__*dt + v_v2*elapsed*dt
+run __DECOMPRESSION_STEPS__
+
+# -----------------------------
+# STAGE 5: FREE EQUILIBRATION (wall removed)
+# Top wall is unfixed so material settles naturally at its springback position.
+# Must remove compute referencing f_top BEFORE unfixing top wall.
+# -----------------------------
+unfix pressure_guard
+unfix pressurelog
+uncompute top_force_sum
+unfix top
+thermo __THERMO_EVERY__
+thermo_style custom step atoms
+run __HOLD_STEPS__
+
+# Final calendered state — material has risen naturally by ~__SPRINGBACK_FRACTION_PCT__%,
+# wall removed, structure freely equilibrated. This is the true post-calendering state.
+write_dump all custom final.calendered.lammpstrj __DUMP_COLUMNS__
+
+# -----------------------------
+# CLEANUP
+# -----------------------------
+undump traj
+unfix grav
+unfix integrator
+unfix damp
+__CLEANUP_EXTRA__
